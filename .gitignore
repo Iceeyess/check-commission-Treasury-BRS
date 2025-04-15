@@ -1,0 +1,9 @@
+*.csv
+*.xls
+*.dsvp
+*.dsv
+*.xlsx
+.venv/
+.venv
+.env/
+.env
