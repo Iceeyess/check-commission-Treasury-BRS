@@ -4,39 +4,42 @@ import chardet
 from openpyxl.styles import PatternFill
 from datetime import datetime
 
-
 start_time = datetime.now()
 
 
 def load_commission_rates():
     """Загружает ставки комиссий из файла setup.xlsx"""
+    default_rates = {
+        'MIR': 0.0142,
+        'MC': 0.02,
+        'VISA': 0.0165,
+        'CUP': 0.0165,
+        'DEFAULT': 0.00  # Используем ставку MIR по умолчанию
+    }
+
     try:
         setup_path = os.path.join(os.getcwd(), 'setup.xlsx')
         if not os.path.exists(setup_path):
-            raise FileNotFoundError("Файл setup.xlsx не найден в рабочей директории")
+            print("Файл setup.xlsx не найден, используются ставки по умолчанию")
+            return default_rates
 
         df = pd.read_excel(setup_path)
         if df.empty:
-            raise ValueError("Файл setup.xlsx пуст")
+            print("Файл setup.xlsx пуст, используются ставки по умолчанию")
+            return default_rates
 
         commission_rates = {}
         for _, row in df.iterrows():
-            card_type = row['Тип карты']
-            rate = row['Ставка комиссии']
+            card_type = str(row['Тип карты']).strip().upper()
+            rate = float(row['Ставка комиссии'])
             commission_rates[card_type] = rate
 
-        commission_rates.setdefault('DEFAULT', 0.01)
+        commission_rates.setdefault('DEFAULT', default_rates['DEFAULT'])
         return commission_rates
 
     except Exception as e:
-        print(f"Ошибка при загрузке ставок комиссий: {str(e)}")
-        return {
-            'MIR': 0.0142,
-            'MC': 0.0200,
-            'VISA': 0.0165,
-            'CUP': 0.0165,  # UnionPay
-            'DEFAULT': 0.00  # Если не определен тип карты
-        }
+        print(f"Ошибка при загрузке ставок комиссий: {str(e)}, используются ставки по умолчанию")
+        return default_rates
 
 
 def detect_encoding(file_path):
@@ -48,45 +51,51 @@ def detect_encoding(file_path):
 
 def read_file_with_encoding(file_path):
     """Читает файл с автоматическим определением кодировки и разделителя"""
-    original_encoding = None
-    if file_path.endswith(('.csv', '.dsv', '.dsvp')):
-        try:
+    try:
+        if file_path.endswith(('.csv', '.dsv', '.dsvp')):
             # Пробуем UTF-8 с разделителем ;
-            df = pd.read_csv(file_path, encoding='utf-8', delimiter=';')
-            original_encoding = 'utf-8'
-            return df, original_encoding
-        except UnicodeDecodeError:
             try:
-                # Пробуем Windows-1251 с разделителем ;
-                df = pd.read_csv(file_path, encoding='windows-1251', delimiter=';')
-                original_encoding = 'windows-1251'
-                return df, original_encoding
+                df = pd.read_csv(file_path, encoding='utf-8', delimiter=';', decimal=',')
+                return df, 'utf-8'
             except UnicodeDecodeError:
-                # Пробуем определить кодировку автоматически
-                encoding = detect_encoding(file_path)
-                df = pd.read_csv(file_path, encoding=encoding, delimiter=';')
-                original_encoding = encoding
-                return df, original_encoding
-        except Exception as e:
-            raise ValueError(f"Ошибка чтения файла {file_path}: {str(e)}")
-    else:
-        try:
+                try:
+                    # Пробуем Windows-1251 с разделителем ;
+                    df = pd.read_csv(file_path, encoding='windows-1251', delimiter=';', decimal=',')
+                    return df, 'windows-1251'
+                except UnicodeDecodeError:
+                    # Пробуем определить кодировку автоматически
+                    encoding = detect_encoding(file_path)
+                    df = pd.read_csv(file_path, encoding=encoding, delimiter=';', decimal=',')
+                    return df, encoding
+        else:
             df = pd.read_excel(file_path)
-            original_encoding = None
-            return df, original_encoding
-        except Exception as e:
-            raise ValueError(f"Ошибка чтения Excel файла: {str(e)}")
+            return df, None
+    except Exception as e:
+        raise ValueError(f"Ошибка чтения файла {file_path}: {str(e)}")
+
+
+def convert_amount(value):
+    """Конвертирует сумму в float, обрабатывая разные форматы"""
+    if isinstance(value, str):
+        # Удаляем пробелы как разделители тысяч и заменяем запятую на точку
+        value = value.replace(' ', '').replace(',', '.')
+    return float(value)
 
 
 def calculate_commission(row, commission_rates):
     """Рассчитывает комиссию с проверкой типа операции"""
     if row['TYPE'] != 'ПОКУПКА':
-        return 0
+        return 0.0
 
-    card_type = row['PMT_SYSTEM_CODE']
-    amount = row['AMOUNT']
-    rate = commission_rates.get(card_type, commission_rates['DEFAULT'])
-    return round(amount * rate, 2)
+    try:
+        card_type = str(row['PMT_SYSTEM_CODE']).strip().upper()
+        amount = convert_amount(row['AMOUNT'])
+        rate = commission_rates.get(card_type, commission_rates['DEFAULT'])
+        commission = round(amount * rate, 2)
+        return commission
+    except Exception as e:
+        print(f"Ошибка расчета комиссии для строки: {row}. Ошибка: {str(e)}")
+        return 0.0
 
 
 def process_file(file_path, results_df, commission_rates):
@@ -101,10 +110,14 @@ def process_file(file_path, results_df, commission_rates):
         if missing_columns:
             raise ValueError(f"Отсутствуют обязательные колонки: {', '.join(missing_columns)}")
 
+        # Конвертируем числовые колонки
+        df['AMOUNT'] = df['AMOUNT'].apply(convert_amount)
+        df['COMMISSION'] = df['COMMISSION'].apply(convert_amount)
+
         # Добавляем расчетные колонки
         df['Комиссия (расчет)'] = df.apply(lambda row: calculate_commission(row, commission_rates), axis=1)
         df['Разница (F - U)'] = df.apply(
-            lambda row: (row['COMMISSION'] - row['Комиссия (расчет)']) if row['TYPE'] == 'ПОКУПКА' else 0,
+            lambda row: (row['COMMISSION'] - row['Комиссия (расчет)']) if row['TYPE'] == 'ПОКУПКА' else 0.0,
             axis=1
         )
         df['Разница (F - U)'] = df['Разница (F - U)'].round(2)
@@ -141,7 +154,7 @@ def process_file(file_path, results_df, commission_rates):
                         row[1].fill = gray_fill
                     elif row[1].value < 0:  # Отрицательная разница
                         row[1].fill = red_fill
-                    else:  # Положительная разница (включая 0.01)
+                    else:  # Положительная разница
                         row[1].fill = green_fill
 
         print(f"Файл обработан и сохранен как: {new_path}")
